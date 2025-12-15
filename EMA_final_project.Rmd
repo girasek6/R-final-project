@@ -1,0 +1,927 @@
+---
+title: "Statisztikai programozás - ELTE PhD - Final project"
+author: "Girasek Hunor (RW8V2Q)"
+output: html_document
+date: "2025-12-15"
+---
+
+```{r setup, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE)
+
+library(tidyverse)
+library(skimr)
+library(lubridate)
+library(stringr)
+library(nortest)
+library(moments)
+library(rstatix)
+library(effectsize)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(ggiraph)
+library(broom)
+library(robustbase)   
+library(lmtest)       
+library(performance)
+library(see)
+library(modelsummary)
+
+
+# Formázott p-érték függvény
+format_p <- function(p) {
+  ifelse(p < 0.001, "< 0.001", as.character(round(p, 3)))}
+```
+
+# Bevezetés
+
+A gyógyszerek forgalomba hozatali engedélyezése összetett, több lépcsős szabályozási folyamat, amelyet az engedélyezést követően is folyamatos felügyelet és a dokumentáció ismtételt aktualizálása kísér. A forgalomba hozatali engedélyhez tartozó dokumentáció módosításai, az úgynevezett revíziók, a gyógyszer teljes életciklusa során tükrözhetik többek között a biztonsági jelzések, a klinikai bizonyítékok bővülésének, illetve a szabályozói eljárások sajátosságainak hatását. Emellett az engedélyezések mennyisége és összetétele (például terápiás területek szerint) időben is változhat, ami az gyógyszerfejlesztési trendek és a gyógyszercégek fókuszának változását mutathatják.
+
+Az Európai Gyógyszerügynökség (European Medicines Agency, EMA) központi szerepet játszik a gyógyszerek engedélyezésében az Európai Unióban. 
+Jelen elemzés célja az EMA gyógyszerengedélyezési adatbázisának részletes vizsgálata, amely négy fő kutatási kérdés köré szerveződik:
+1. Az engedélyezések időbeli trendjeinek feltárása 1995 és 2023 között.
+2. Az ATC-csoportok (Anatomical Therapeutic Chemical) közötti különbségek vizsgálata kulcsváltozók mentén
+3. A revíziók számát befolyásoló tényezők azonosítása többváltozós modellezéssel
+4. A központi idegrendszeri (ATC: N csoport) készítményeknél a terápiás területek és hatóanyagok kapcsolati szerkezetének hálózati szemléletű bemutatása.
+
+Az elemzéshez az EMA nyilvánosan elérhető adatbázisát használtam, amely a TidyTuesday projekt keretében került publikálásra (2023. március 14.).
+
+# Adatok előkészítése
+
+Az elemzés reprodukálható módon, webes forrásból betöltött adatbázison alapul, közvetlenül a TidyTuesday GitHub tárhelyéről került beolvasásra.
+
+```{r Adat_beolvasasa}
+
+# Adat beolvasása a GitHub-ról
+drugs <- 
+  readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2023/2023-03-14/drugs.csv')
+```
+
+```{r Adattabla_attekintese}
+
+# Adatok áttekintése
+dim(drugs)
+names(drugs)
+glimpse(drugs)
+skimr::skim(drugs)
+```
+
+```{r Adattabla_tisztasa}
+
+# Folytonos változók kialakítása
+## Gyógyszer piacon töltött idejének (days_on_market változó) kiszámítása napokban (Az adatbázis feltöltési dátuma: 2023.03.13.)
+drugs <- drugs %>%
+  mutate(
+    days_on_market = as.numeric(ymd("2023-03-13") - ymd(marketing_authorisation_date)))
+
+## Ellenörzés - days_on_market
+summary(drugs$days_on_market)
+
+## Eloszlás - days_on_market
+ggplot(drugs, aes(x = days_on_market)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(x = "Napok száma a piacon", y = "Gyakoriság") +
+  theme_minimal()
+```
+
+A „piacon töltött időt” (days_on_market változó) a forgalomba hozatali engedély dátuma és az adatbázis feltöltési dátuma (2023-03-13) közötti napok száma alapján képeztem, ezzel biztosítva, hogy a mutató ne függjön a futtatás aktuális dátumától.
+
+# Adatok feldolgozása
+
+## Minta
+
+Az adatbázis összesen 1988 gyógyszert tartalmaz, amelyek közül 1706 (85.8%) humán és 282 (14.2%) állatgyógyászati készítmény. Az adatbázis 28 változót tartalmaz, beleértve a gyógyszer nevét, terápiás területét, hatóanyagát, ATC kódját, engedélyezési dátumát és státuszát, valamint olyan különböző jellemzőket a gyógyszerekkel kapcsolatban, mint pl. generikus, orphan, gyorsított eljárás stb.
+
+A gyógyszerek engedélyezési dátuma 1995. október 20. és 2023. február 20. között oszlik meg (medián: 2013. június 9.). Az engedélyezési státusz tekintetében a gyógyszerek 79.1%-a (n = 1573) rendelkezik érvényes engedéllyel, 18.0% (n = 357) visszavont, és 2.9% (n = 57) elutasított státuszú.
+
+A speciális státuszok tekintetében a gyógyszerek 15.8%-a (n = 315) generikus, 8.2%-a (n = 162) orphan gyógyszer és 2.4%-a (n = 48) részesült gyorsított eljárásban.
+
+A gyógyszerek piacon töltött idejének eloszlása a teljes mintában széles tartományt fed le (Min: 21 nap; Mdn: 3564 nap; M: 3948 nap; Max: 10006 nap; NA: 60).
+
+```{r Leiro_statisztika}
+
+# Kategórikus változók gyakorisága és százalékos eloszlása
+vars <- c(
+  "category", "patient_safety", "authorisation_status", "generic",
+  "conditional_approval", "exceptional_circumstances",
+  "accelerated_assessment", "orphan_medicine")
+
+cat_tables <- drugs %>%
+  select(all_of(vars)) %>%
+  lapply(function(x) {
+    tab <- table(x, useNA = "ifany")
+    pct <- prop.table(tab) * 100
+    data.frame(
+      value   = names(tab),
+      n       = as.integer(tab),
+      percent = round(as.numeric(pct), 1),
+      row.names = NULL)})
+
+cat_tables$category
+cat_tables$patient_safety
+cat_tables$authorisation_status
+cat_tables$generic
+cat_tables$conditional_approval
+cat_tables$exceptional_circumstances
+cat_tables$accelerated_assessment
+cat_tables$orphan_medicine
+
+# Piacon töltött idő (days_on_market) leíró statisztikája
+summary(drugs$days_on_market)
+```
+
+```{r Gyogyszer_engedélyezések_száma-Abra}
+
+# Gyógyszerek engedélyezésének száma évente
+drugs %>%
+  filter(!is.na(marketing_authorisation_date)) %>%
+  mutate(year = year(marketing_authorisation_date)) %>%
+  count(year) %>%
+  ggplot(aes(year, n)) +
+  geom_line() +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 1), minor_breaks = NULL, limits = c(NA, 2022)) +
+  labs(title = "Gyógyszer-engedélyezések száma évente", x = "Év", y = "n") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Top 10 gyártó
+drugs %>%
+  count(marketing_authorisation_holder_company_name, sort = TRUE) %>%
+  head(10)
+```
+
+## Gyógyszer-engedélyezési trendek
+
+Az 1. ábra a gyógyszer-engedélyezések számának alakulását mutatja az 1995-2022 közötti időszakban. A trendvonal jelentős fluktuációt mutat, kiugró csúcsokkal 2001 (n ≈ 90), 2017 (n ≈ 110) és 2021 körül (n ≈ 120). A COVID-19 pandémia időszakában (2020-2021) a gyógyszer-engedélyezések száma jelentősen megugrott, ami feltételezhetően a vakcinák és vírusellenes szerek gyorsított engedélyezésének tudható be elsősorban.
+
+A forgalmazási engedély jogosultjai közül a legtöbb gyógyszert az Accord Healthcare S.L.U. és a Novartis Europharm Limited jegyzi (egyaránt n = 58), amelyeket a Pfizer Europe MA EEIG (n = 43) és a Zoetis Belgium SA (n = 40) követ.
+
+# ATC-rendszer
+
+A humán készítmények ATC-főcsoport szerinti bontása lehetővé teszi annak áttekintését, hogy az engedélyezések elsősorban mely terápiás területekhez kapcsolódtak, illetve hogyan alakultak ezen időszakban. Az ATC-főcsoportok szerinti évekre vontott ábra a főcsoportok közötti nagyságrendi különbségeket és az időbeli dinamikát együttesen teszi láthatóvá, így a későbbi, célzottabb összehasonlítások megalapozására szolgálhat.
+
+```{r ATC_kodok}
+
+# Human gyógyszerek ATC kód csoportonként
+drugs %>%
+  filter(category == "human", !is.na(marketing_authorisation_date), !is.na(atc_code)) %>%
+  mutate(
+    year = year(marketing_authorisation_date),
+    atc_group = str_extract(atc_code, "^[A-Z]")) %>%
+  count(year, atc_group) %>%
+  ggplot(aes(year, n)) +
+  geom_line() +
+  facet_wrap(~atc_group, scales = "free_x") +
+  scale_x_continuous(breaks = seq(1995, 2022, by = 5), limits = c(1995, 2022), minor_breaks = NULL) +
+  labs(
+    title = "Humán gyógyszer-engedélyezések száma évente ATC-rendszer szerint",
+    x = "Év",
+    y = "n",
+    caption = "Note. ATC besorolás: A - Tápcsatorna és anyagcsere; B - Vér és vérképzőszervek; C - Cardiovascularis rendszer; D - Bőrgyógyászati készítmények; G - Urogenitalis rendszer és nemi hormonok;\nH - Szisztémás hormonkészítmények; J - Szisztémás fertőzésellenes szerek; L - Daganatellenes és immunmoduláns szerek; M - Váz- és izomrendszer; N - Központi idegrendszer;\nP - Parazitaellenes készítmények; R - Légzőrendszer; S - Érzékszervek; V - Egyéb") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 10),
+    plot.caption = element_text(hjust = 0, size = 9))
+
+# Heatmap - ATC csoportok évenete
+drugs %>%
+  filter(category == "human", !is.na(marketing_authorisation_date), !is.na(atc_code)) %>%
+  mutate(
+    year = year(marketing_authorisation_date),
+    atc_group = str_extract(atc_code, "^[A-Z]")) %>%
+  filter(year <= 2022) %>%
+  count(year, atc_group) %>%
+  group_by(year) %>%
+  mutate(percent = n / sum(n) * 100) %>%
+  ungroup() %>%
+  ggplot(aes(x = atc_group, y = factor(year), fill = percent)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(n > 0, n, "")), size = 2.5) +
+  scale_fill_gradient(low = "white", high = "steelblue", na.value = "white") +
+  labs(
+    title = "Humán gyógyszer-engedélyezésének száma ATC-rendszer szerint",
+    x = "ATC csoport",
+    y = "Év",
+    fill = "Arány (%)",
+    caption = "Note. ATC besorolás: A - Tápcsatorna és anyagcsere; B - Vér és vérképzőszervek; C - Cardiovascularis rendszer; D - Bőrgyógyászati készítmények; G - Urogenitalis rendszer és nemi hormonok; \nH - Szisztémás hormonkészítmények; J - Szisztémás fertőzésellenes szerek; L - Daganatellenes és immunmoduláns szerek; M - Váz- és izomrendszer; N - Központi idegrendszer; \nP - Parazitaellenes készítmények; R - Légzőrendszer; S - Érzékszervek; V - Egyéb") +
+  theme_minimal() +
+  theme(
+    plot.caption = element_text(hjust = 0, size = 9),
+    panel.grid = element_blank())
+
+# ATC csoportok gyakorisága a teljes időszakban
+drugs %>%
+  filter(category == "human", !is.na(atc_code)) %>%
+  mutate(atc_group = str_extract(atc_code, "^[A-Z]")) %>%
+  count(atc_group, sort = TRUE) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+```
+
+## Az ATC-rendszer szerinti megoszlás
+
+Az ATC-rendszer szerinti elemzés a humán gyógyszerekre korlátozódott. A 14 fő ATC csoportból a leggyakoribb az L csoport (daganatellenes és immunmoduláns szerek; n = 463, 27.5%), amelyet a J csoport (szisztémás fertőzésellenes szerek; n = 253, 15.1%), az A csoport (tápcsatorna és anyagcsere; n = 201, 12.0%) és az N csoport (központi idegrendszer; n = 186, 11.1%) követ. Ez a négy csoport együttesen a humán gyógyszerek 65.7%-át teszi ki.
+
+A heatmap-vizualizáció (2. ábra) az ATC csoportok éves megoszlását szemlélteti. Az L csoport dominanciája különösen az elmúlt évtizedben vált hangsúlyossá, ami feltehetően a precíziós onkológia és az immunterápiák fejlődésével magyarázható.
+
+A további elemzéseket a négy leggyakoribb ATC csoportra (L, J, A, N) szűkítettem, amelyek együttesen 1103 gyógyszert foglalnak magukban.
+
+# Statisztikai elemzések - TOP4 ATC
+
+```{r Top_4_ATC_leiro_statisztika}
+
+# Top 4 ATC csoport kiszűrése
+top4_atc <- drugs %>%
+  filter(category == "human", !is.na(atc_code)) %>%
+  mutate(atc_group = str_extract(atc_code, "^[A-Z]")) %>%
+  filter(atc_group %in% c("L", "J", "A", "N"))
+
+# Leíró statisztika - revision_number
+top4_atc %>%
+  group_by(atc_group) %>%
+  summarise(
+    n = n(),
+    hianyzo = sum(is.na(revision_number)),
+    atlag = mean(revision_number, na.rm = TRUE),
+    sd = sd(revision_number, na.rm = TRUE),
+    min = min(revision_number, na.rm = TRUE),
+    q25 = quantile(revision_number, 0.25, na.rm = TRUE),
+    median = median(revision_number, na.rm = TRUE),
+    q75 = quantile(revision_number, 0.75, na.rm = TRUE),
+    max = max(revision_number, na.rm = TRUE))
+
+# Leíró statisztika - days_on_market
+top4_atc %>%
+  group_by(atc_group) %>%
+  summarise(
+    n = n(),
+    hianyzo = sum(is.na(days_on_market)),
+    atlag = mean(days_on_market, na.rm = TRUE),
+    sd = sd(days_on_market, na.rm = TRUE),
+    min = min(days_on_market, na.rm = TRUE),
+    q25 = quantile(days_on_market, 0.25, na.rm = TRUE),
+    median = median(days_on_market, na.rm = TRUE),
+    q75 = quantile(days_on_market, 0.75, na.rm = TRUE),
+    max = max(days_on_market, na.rm = TRUE))
+
+# ATC csoport nevek hozzáadása
+top4_atc <- top4_atc %>%
+  mutate(atc_name = case_when(
+    atc_group == "L" ~ "L - Daganatellenes és\nimmunomoduláns szerek",
+    atc_group == "J" ~ "J - Szisztémás\nfertőzésellenes szerek",
+    atc_group == "A" ~ "A - Tápcsatorna\nés anyagcsere",
+    atc_group == "N" ~ "N - Központi\nidegrendszer"
+  ))
+
+# Violin plot - revision_number
+ggplot(top4_atc, aes(x = atc_name, y = revision_number, fill = atc_name)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "red") +
+  labs(
+    title = "Revíziók száma ATC csoportonként",
+    x = "ATC csoport",
+    y = "Revíziók száma"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Violin plot - days_on_market
+ggplot(top4_atc, aes(x = atc_name, y = days_on_market, fill = atc_name)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "red") +
+  labs(
+    title = "Piacon eltöltött napok száma ATC csoportonként",
+    x = "ATC csoport",
+    y = "Napok száma"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Leíró statisztika
+
+A revíziók számának leíró statisztikáját az 1. táblázat foglalja össze. A revíziók átlagos száma a négy ATC csoportban 14.1 és 17.7 között mozgott. A legmagasabb átlagot a J csoport mutatta (M = 17.7, SD = 14.2), míg a legalacsonyabbat az A csoport (M = 14.1, *SD* = 9.5).
+
+A piacon töltött idő tekintetében az L csoport gyógyszerei átlagosan rövidebb ideje vannak a piacon (M = 3130 nap, SD = 2455), mint az A (M = 4182 nap, SD = 2524) és J (M = 4300 nap, SD = 2774) csoport készítményei.
+
+A violin plotok (3. és 4. ábra) vizuálisan is szemléltetik a csoportok közötti különbségeket.
+
+```{r Top_4_ATC_normalitas_vizsgalata}
+
+# Függő változó: revision_number
+## Shapiro-Wilk teszt - revision_number
+top4_atc %>%
+  group_by(atc_name) %>%
+  summarise(
+    W = round(shapiro.test(revision_number)$statistic, 3),
+    p_value = format_p(shapiro.test(revision_number)$p.value))
+
+## Lilliefors teszt - revision_number
+top4_atc %>%
+  group_by(atc_name) %>%
+  summarise(
+    D = round(lillie.test(revision_number)$statistic, 3),
+    p_value = format_p(lillie.test(revision_number)$p.value))
+
+# Függő változó: days_on_market
+## Shapiro-Wilk teszt - days_on_market
+top4_atc %>%
+  group_by(atc_name) %>%
+  summarise(
+    W = round(shapiro.test(days_on_market)$statistic, 3),
+    p_value = format_p(shapiro.test(days_on_market)$p.value))
+
+## Lilliefors teszt - days_on_market
+top4_atc %>%
+  group_by(atc_name) %>%
+  summarise(
+    D = round(lillie.test(days_on_market)$statistic, 3),
+    p_value = format_p(lillie.test(days_on_market)$p.value))
+
+# Ferdeség és csúcsosság
+top4_atc %>%
+  group_by(atc_name) %>%
+  summarise(
+    skewness_revision = round(skewness(revision_number, na.rm = TRUE), 3),
+    kurtosis_revision = round(kurtosis(revision_number, na.rm = TRUE), 3),
+    skewness_days = round(skewness(days_on_market, na.rm = TRUE), 3),
+    kurtosis_days = round(kurtosis(days_on_market, na.rm = TRUE), 3))
+
+# Vizuális módszerek
+## Hisztogram - revision_number
+ggplot(top4_atc, aes(x = revision_number, fill = atc_name)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_wrap(~atc_name, scales = "free") +
+  labs(
+    title = "Revíziók számának eloszlása ATC csoportonként",
+    x = "Revíziók száma",
+    y = "Gyakoriság") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+## Q-Q plot - revision_number
+ggplot(top4_atc, aes(sample = revision_number, color = atc_name)) +
+  stat_qq() +
+  stat_qq_line() +
+  facet_wrap(~atc_name, scales = "free") +
+  labs(
+    title = "Q-Q plot: Revíziók száma ATC csoportonként",
+    x = "Elméleti kvantilisek",
+    y = "Minta kvantilisek") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+## Hisztogram - days_on_market
+ggplot(top4_atc, aes(x = days_on_market, fill = atc_name)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_wrap(~atc_name, scales = "free") +
+  labs(
+    title = "Piacon eltöltött napok eloszlása ATC csoportonként",
+    x = "Napok száma",
+    y = "Gyakoriság") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+## Q-Q plot - days_on_market
+ggplot(top4_atc, aes(sample = days_on_market, color = atc_name)) +
+  stat_qq() +
+  stat_qq_line() +
+  facet_wrap(~atc_name, scales = "free") +
+  labs(
+    title = "Q-Q plot: Piacon eltöltött napok ATC csoportonként",
+    x = "Elméleti kvantilisek",
+    y = "Minta kvantilisek") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## A normalitás vizsgálata
+
+A paraméteres statisztikai eljárások alkalmazhatóságának előfeltételeként a függő változók normalitását Shapiro-Wilk és Lilliefors (Kolmogorov-Smirnov korrekció) tesztekkel vizsgáltam.
+
+A revíziók számának eloszlása a Shapiro-Wilk teszt alapján egyik ATC csoportban sem követte a normális eloszlást (p < .001). A Lilliefors teszt eredményei megerősítették ezt a mintázatot (p < .001). A ferdeségi mutatók pozitív értékeket vettek fel (skewness = 0.36–1.55), ami jobbra ferde eloszlásokra utal. A csúcsossági értékek (kurtosis = 2.19–6.48) az L csoportban kifejezetten leptokurtikus eloszlást jeleztek.
+
+A piacon töltött idő esetében hasonló eredmények lárhatók. A Shapiro-Wilk teszt valamennyi csoportban szignifikáns eltérést mutatott a normalitástól (p < .001). A Lilliefors teszt az N csoport kivételével (p = .091) szintén szignifikáns eredményeket adott.
+
+A Q-Q plotok (5-8. ábra) vizuálisan is alátámasztják a normalitástól való eltérést, különösen az eloszlások szélein megfigyelhető szisztematikus eltérésekkel.
+
+Tekintettel a normalitás sérülésére, a csoportok összehasonlításához nem-paraméteres statisztikai eljárásokat alkalmaztam.
+
+```{r Top_4_ATC_statisztikai_elemzes}
+
+# Függő változó: revison_number
+## Kruskal-Wallis teszt - revision_number
+top4_atc %>%
+  kruskal_test(revision_number ~ atc_group) %>%
+  mutate(p = format_p(p))
+
+## Kruskal-Wallis hatásméret (eta²) - revision_number
+top4_atc %>%
+  kruskal_effsize(revision_number ~ atc_group, ci = TRUE)
+
+## Dunn-teszt Holm korrekcióval - revision_number
+dunn_revision <- dunn_test(revision_number ~ atc_group, data = top4_atc, p.adjust.method = "holm")
+dunn_revision %>%
+  mutate(p.adj = format_p(p.adj))
+
+## Cliff's delta függvény 95% CI-vel
+calc_cliffs_delta <- function(data, var, group1, group2) {
+  x <- data %>% filter(atc_group == group1) %>% pull({{var}})
+  y <- data %>% filter(atc_group == group2) %>% pull({{var}})
+  result <- effectsize::cliffs_delta(x, y, ci = 0.95)
+  tibble(
+    group1 = group1,
+    group2 = group2,
+    cliffs_delta = round(result$r, 3),
+    ci_low = round(result$CI_low, 3),
+    ci_high = round(result$CI_high, 3)
+  )
+}
+
+## Cliff's delta páronként - revision_number
+pairs <- combn(unique(top4_atc$atc_group), 2, simplify = FALSE)
+map_df(pairs, ~calc_cliffs_delta(top4_atc, revision_number, .x[1], .x[2]))
+
+
+# Függő változó: days_on_market
+## Kruskal-Wallis teszt - days_on_market
+top4_atc %>%
+  kruskal_test(days_on_market ~ atc_group) %>%
+  mutate(p = format_p(p))
+
+## Kruskal-Wallis hatásméret (eta²) - days_on_market
+top4_atc %>%
+  kruskal_effsize(days_on_market ~ atc_group, ci = TRUE)
+
+## Dunn-teszt Holm korrekcióval - days_on_market
+dunn_days <- dunn_test(days_on_market ~ atc_group, data = top4_atc, p.adjust.method = "holm")
+dunn_days %>%
+  mutate(p.adj = format_p(p.adj))
+
+## Cliff's delta páronként - days_on_market
+map_df(pairs, ~calc_cliffs_delta(top4_atc, days_on_market, .x[1], .x[2]))
+```
+
+## Csoportok összehasonlítása
+
+### Revíziók száma
+
+A négy ATC csoport közötti különbséget Kruskal-Wallis teszttel vizsgáltam. Az eredmények szignifikáns különbséget mutattak a csoportok között (H(3) = 9.39, p = .025). A hatásméret ugyanakkor kicsi volt (η² = 0.006, 95% CI [-0.001, 0.020]). A 95% CI alsó határa 0 közelébe esik (a becslési eljárás miatt numerikusan enyhén negatív), ami a hatás elhanyagolható mértékével konzisztens.
+A Dunn-féle post-hoc teszt Holm-korrekcióval egyetlen szignifikáns páronkénti különbséget tárt fel. A J csoport (szisztémás fertőzésellenes szerek) szignifikánsan magasabb revíziószámmal rendelkezett, mint az L csoport (daganatellenes szerek), (padj = .013). A Cliff's delta hatásméret mutató eredménye alapján kis hatásméret írható le a két csoport között (d = -0.137, 95% CI [-0.224, -0.048]).
+
+### Piacon töltött idő
+
+A piacon töltött idő tekintetében a Kruskal-Wallis teszt erősen szignifikáns különbséget mutatott a csoportok között (H(3) = 48.2, p < .001). A hatásméret kis-közepes mértékű volt (η² = 0.041, 95% CI [0.020, 0.070]).
+A Dunn-féle post-hoc teszt három szignifikáns páronkénti különbséget tárt fel (padj < .001). Az L csoport gyógyszerei szignifikánsan rövidebb ideje vannak a piacon, mint az A csoport (d = -0.256), a J csoport (d = -0.254) és az N csoport (d = -0.230) készítményei. Ez a mintázat összhangban van az onkológiai területen tapasztalható intenzívebb kutatás-fejlesztési aktivitással és a gyorsabb gyógyszercserélődéssel.
+
+# Hálózatelemzés
+
+## Adatok előkészítése
+
+```{r Halozat-adatok_elokeszitese}
+
+# A therapeutic_area változó tördelése
+drugs_clean <- drugs %>%
+  separate_rows(therapeutic_area, sep = "\\s*;\\s*") %>% 
+  mutate(therapeutic_area = trimws(therapeutic_area))
+
+# N ATC csoport kiszűrése (központi idegrendszer)
+drugs_N <- drugs_clean %>%
+  filter(!is.na(atc_code)) %>%
+  mutate(atc_group = str_extract(atc_code, "^[A-Z]")) %>%
+  filter(atc_group == "N") %>%
+  filter(!is.na(therapeutic_area))
+
+# Összefoglaló statisztika
+drugs_N %>%
+  summarise(
+    n_drugs = n_distinct(medicine_name),
+    n_areas = n_distinct(therapeutic_area),
+    n_substances = n_distinct(active_substance),
+    n_companies = n_distinct(marketing_authorisation_holder_company_name))
+```
+
+A hálózatelemzés a központi idegrendszeri (N) ATC csoportra fókuszált, amely a pszichiátriai és neurológiai gyógyszereket foglalja magában. A vizsgálat célja a terápiás területek és hatóanyagok közötti kapcsolatok feltérképezése volt.
+
+Az N csoportban összesen 185 egyedi gyógyszer, 70 terápiás terület, 101 hatóanyag és 111 forgalmazó cég volt azonosítható. A therapeutic_area változó pontosvesszővel elválasztott többszörös értékeket tartalmazott, amelyeket külön sorokra bontottam a hálózatépítéséhez.
+
+## Szűrés és hálózat építése
+
+```{r Halozat_epites}
+
+# Csak a gyakoribb terápiás területek és hatóanyagok (min. 3 előfordulás)
+top_areas_N <- drugs_N %>%
+  count(therapeutic_area) %>%
+  filter(n >= 3) %>%
+  pull(therapeutic_area)
+
+top_substances_N <- drugs_N %>%
+  count(active_substance) %>%
+  filter(n >= 3) %>%
+  pull(active_substance)
+
+# Szűrt adatok
+drugs_N_filtered <- drugs_N %>%
+  filter(therapeutic_area %in% top_areas_N | active_substance %in% top_substances_N)
+
+# Élsúlyok hozzáadása (hány gyógyszer kapcsolja össze őket)
+edges_weighted <- drugs_N_filtered %>%
+  count(therapeutic_area, active_substance, name = "weight") %>%
+  rename(from = therapeutic_area, to = active_substance)
+
+# ATC alcsoport kinyerése (N01, N02, stb.)
+atc_subgroups <- drugs_N_filtered %>%
+  select(therapeutic_area, active_substance, atc_code) %>%
+  mutate(atc_subgroup = str_extract(atc_code, "^N\\d{2}")) %>%
+  distinct(active_substance, atc_subgroup) %>%
+  group_by(active_substance) %>%
+  slice(1) %>%
+  ungroup()
+
+# Csúcsok létrehozása típussal és ATC alcsoporttal
+nodes_areas_f <- drugs_N_filtered %>%
+  distinct(therapeutic_area) %>%
+  rename(name = therapeutic_area) %>%
+  mutate(type = "Terápiás terület", atc_subgroup = NA_character_)
+
+nodes_substances_f <- drugs_N_filtered %>%
+  distinct(active_substance) %>%
+  rename(name = active_substance) %>%
+  mutate(type = "Hatóanyag") %>%
+  left_join(atc_subgroups, by = c("name" = "active_substance"))
+
+nodes_f <- bind_rows(nodes_areas_f, nodes_substances_f)
+
+# Hálózat létrehozása súlyozott élekkel
+network_f <- tbl_graph(nodes = nodes_f, edges = edges_weighted, directed = FALSE)
+
+# Fokszám és klaszter hozzáadása
+network_f <- network_f %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    cluster = as.factor(group_louvain()))
+```
+
+## Hálózat vizualizáció
+
+```{r Halozat_abra-Interaktiv}
+
+# Hálózat vizualizációja - Interaktív ábra (jobb átláthatóság)
+layout_coords <- create_layout(network_f, layout = "fr")
+layout_coords$x <- layout_coords$x * 2
+layout_coords$y <- layout_coords$y * 2
+
+p <- ggraph(layout_coords) +
+  geom_edge_link(aes(width = weight), alpha = 0.3, color = "gray50") +
+  geom_point_interactive(aes(
+    x = x, y = y,
+    size = degree,
+    color = ifelse(type == "Terápiás terület", "Terápiás terület", atc_subgroup),
+    alpha = degree,
+    tooltip = paste0(name, "\nKapcsolatok: ", degree),
+    data_id = name
+  )) +
+  scale_size_continuous(range = c(2, 12)) +
+  scale_alpha_continuous(range = c(0.5, 1)) +
+  scale_edge_width_continuous(range = c(0.3, 3)) +
+  scale_color_manual(
+    values = c(
+      "Terápiás terület" = "steelblue",
+      "N01" = "#E41A1C",
+      "N02" = "#FF7F00",
+      "N03" = "#4DAF4A",
+      "N04" = "#984EA3",
+      "N05" = "#F781BF",
+      "N06" = "#A65628",
+      "N07" = "#999999"
+    ),
+    na.value = "coral"
+  ) +
+  labs(
+    title = "Terápiás területek és hatóanyagok hálózata (Interaktív)",
+    subtitle = "N (központi idegrendszer) ATC csoport - Kérem, vigye az egeret a pontokra a részletekért",
+    color = "Típus / ATC alcsoport",
+    size = "Kapcsolatok száma",
+    edge_width = "Közös gyógyszerek"
+  ) +
+  theme_graph() +
+  theme(legend.position = "right") +
+  guides(alpha = "none")
+
+girafe(
+  ggobj = p,
+  width_svg = 14,
+  height_svg = 10,
+  options = list(
+    opts_zoom(max = 5),
+    opts_hover(css = "fill:red;stroke:black;stroke-width:2;"),
+    opts_tooltip(css = "background-color:white;padding:8px;border-radius:5px;border:1px solid gray;font-size:12px;")))
+```
+
+```{r Halozatelemzes_mutatok}
+
+# Alapvető hálózati statisztikák
+network_stats <- tibble(
+  Mutató = c(
+    "Csúcsok száma (nodes)",
+    "Élek száma (edges)", 
+    "Sűrűség (density)",
+    "Átlagos fokszám (mean degree)",
+    "Átmérő (diameter)",
+    "Átlagos úthossz (mean distance)",
+    "Tranzitivitás (clustering coefficient)"
+  ),
+  Érték = c(
+    vcount(network_f),
+    ecount(network_f),
+    round(edge_density(network_f), 3),
+    round(mean(degree(network_f)), 2),
+    diameter(network_f),
+    round(mean_distance(network_f), 2),
+    round(transitivity(network_f), 3)))
+network_stats
+
+# Centralitás mutatók hozzáadása a hálózathoz
+network_f <- network_f %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    betweenness = round(centrality_betweenness(), 2),
+    closeness = round(centrality_closeness(), 4),
+    eigenvector = round(centrality_eigen(), 3))
+
+# Top 20 csúcs különböző centralitás mutatók alapján
+network_f %>%
+  activate(nodes) %>%
+  as_tibble() %>%
+  arrange(desc(degree)) %>%
+  select(name, type, degree, betweenness, closeness, eigenvector) %>%
+  head(20)
+```
+
+## Hálózatemezés mutatók
+
+A kétoldalú (bipartite) hálózat 110 csúcspontot (terápiás területek és hatóanyagok) és 108 élt (kapcsolatot) tartalmaz. A hálózat ritkának tekinthető (sűrűség = 0.018), ami azt jelenti, hogy az összes lehetséges kapcsolat mindössze 1.8%-a realizálódik. Az átlagos fokszám 1.96, ami arra utal, hogy egy csúcspont átlagosan közel két másik csúcsponttal áll kapcsolatban.
+
+A hálózat átmérője 32, az átlagos úthossz pedig 6.61, ami viszonylag szétszórt, kevéssé integrált struktúrára utal. A tranzitivitás (klaszterezési együttható) értéke 0, ami a bipartite hálózatok sajátossága, ahol azonos típusú csúcspontok nem kapcsolódnak közvetlenül egymáshoz.
+
+### Centralitás elemzés
+
+A fokszám-centralitás alapján a legkiemelkedőbb terápiás területek a Parkinson-kór (fokszám = 14), a Szkizofrénia (fokszám = 11) és az Epilepszia (fokszám = 10). Ezek a betegségterületek számos különböző hatóanyaggal állnak kapcsolatban, ami a terápiás lehetőségek sokféleségét tükrözi.
+
+A közöttiség-centralitás (betweenness) tekintetében az Epilepszia (176.0) és a Parkinson-kór (167.0) kiemelkedik, ami arra utal, hogy ezek a terápiás területek híd szerepet töltenek be a hálózatban, összekapcsolva más, egyébként elszigetelt klasztereket.
+
+A hatóanyagok közül az amifampridine-foszfát rendelkezik a legmagasabb fokszámmal (13), amely a Lambert-Eaton myastheniás szindróma és más neuromuszkuláris betegségek kezelésében használatos. A duloxetin (fokszám = 5) és a pregabalin (fokszám = 3) szintén kiemelkedő pozíciót foglal el, ami széles terápiás alkalmazhatóságukat tükrözi (fájdalom, depresszió, szorongás, neuropátia).
+
+
+# Regressziós modellek
+
+```{r Regresszios_modell}
+
+# Regressziós modell előkészítése
+model_df <- top4_atc %>%
+  transmute(
+    revision_number,
+    days_on_market,
+    atc_group,
+    generic,
+    orphan_medicine,
+    accelerated_assessment
+  ) %>%
+  filter(
+    !is.na(revision_number),
+    !is.na(days_on_market),
+    !is.na(atc_group)
+  ) %>%
+  mutate(
+    atc_group = factor(atc_group),
+    generic = factor(generic),
+    orphan_medicine = factor(orphan_medicine),
+    accelerated_assessment = factor(accelerated_assessment),
+    days_on_market_z = as.numeric(scale(days_on_market)))
+
+skimr::skim(model_df)
+```
+
+A revíziók számát befolyásoló tényezők azonosítására többváltozós lineáris regressziós modelleket építettem. A függő változó a revíziók száma volt, a prediktorok pedig az ATC csoport, a piacon töltött idő (z-standardizált), a generikus státusz, az orphan gyógyszer státusz és a gyorsított értékelés.
+
+Az elemzés 1026 megfigyelésen alapult a hiányzó értékek kizárása után. A piacon töltött idő változót z-standardizáltam az együtthatók értelmezhetősége érdekében.
+
+Két modellt hasonlítottam össze: hagyományos legkisebb négyzetek (OLS) regressziót és robusztus regressziót (MM-becslő), amely kevésbé érzékeny a kiugró értékekre.
+
+## Regressziós modellek létrehozása
+
+```{r Regresszios_modell_letrehozasa}
+
+# Regressziós modellek létrehozása - két modell: lm vs. lmrob (robusztus) 
+mod_lm <- lm(
+  revision_number ~ atc_group + days_on_market_z + generic + orphan_medicine + accelerated_assessment,
+  data = model_df)
+
+mod_rob <- lmrob(
+  revision_number ~ atc_group + days_on_market_z + generic + orphan_medicine + accelerated_assessment,
+  data = model_df)
+
+# Regressziós modellek eredményei
+summary(mod_lm)
+summary(mod_rob)
+```
+
+
+## Regressziós modellek összehasolítása
+
+```{r Modell_osszehasonlitas}
+
+# Együtthatók összehasonlítása
+coef_comparison <- bind_rows(
+  tidy(mod_lm, conf.int = TRUE) %>% mutate(model = "OLS"),
+  tidy(mod_rob, conf.int = TRUE) %>% mutate(model = "Robust"))
+
+coef_comparison %>%
+  select(model, term, estimate, std.error, conf.low, conf.high, p.value) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    std.error = round(std.error, 3),
+    conf.low = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    p.value = format_p(p.value))
+
+# Együtthatók vizualizációja
+ggplot(coef_comparison %>% filter(term != "(Intercept)"), 
+       aes(x = estimate, y = term, color = model)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), 
+                 position = position_dodge(width = 0.5), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Regressziós együtthatók összehasonlítása",
+    subtitle = "OLS vs. Robusztus regresszió",
+    x = "Becsült együttható (95% CI)",
+    y = "Prediktor",
+    color = "Modell"
+  ) +
+  theme_minimal()
+```
+
+### Regressziós eredmények
+
+#### OLS modell
+
+Az OLS modell szignifikánsan illeszkedett az adatokra, F(7, 1018) = 89.42, p < .001, és a revíziószám varianciájának 38.1%-át magyarázta (R² = .381, R²adj = .377).
+
+A piacon töltött idő volt a legerősebb prediktor: minden egységnyi növekedés a z-standardizált piacon töltött időben 7.20 egységgel növelte a revíziók számát, B = 7.20, 95% CI [6.56, 7.85], p < .001. Ez azt jelenti, hogy a régebben engedélyezett gyógyszerek több revízión estek át.
+
+Az ATC csoport szignifikáns prediktornak bizonyult. A referenciakategóriához (A csoport) képest a J csoport (B = 3.10, p = .001), az L csoport (B = 3.63, p < .001) és az N csoport (B = 2.28, p = .028) egyaránt szignifikánsan magasabb revíziószámmal rendelkezett.
+
+A generikus státusz szignifikáns negatív összefüggést mutatott a revíziók számával (B = -4.18, 95% CI [-5.80, -2.55], p < .001), ami arra utal, hogy a generikus gyógyszerek átlagosan 4.18-cal kevesebb revízión esnek át, mint az originális készítmények.
+
+A gyorsított értékelés szignifikáns pozitív prediktora volt a revíziószámnak (B = 3.69, 95% CI [0.05, 7.34], p = .047). Az orphan gyógyszer státusz nem mutatott szignifikáns összefüggést (B = -1.09, p = .334).
+
+#### Robusztus modell
+
+A robusztus regresszió (MM-becslő) 28 megfigyelést azonosított kiugró értékként. A robusztus modell lényegesen magasabb magyarázóerővel rendelkezett (R² = .626, R²adj = .623), ami arra utal, hogy a kiugró értékek jelentősen torzították az OLS becsléseket.
+
+A prediktorok mintázata hasonló maradt, de néhány fontos eltérés mutatkozott. A piacon töltött idő hatása erősebb volt a robusztus modellben (B = 8.90, 95% CI [8.07, 9.72], p < .001). Illetve a gyorsított értékelés hatása is robusztusabbá vált (B = 3.69, p = .002).
+
+#### Modell összehasonlítás
+
+A keresztvalidáció (80-20% train-test split) alapján a robusztus modell kissé jobb prediktív teljesítményt mutatott: RMSE = 11.5 vs. 11.7, MAE = 7.32 vs. 7.68, R²pred = .376 vs. .356.
+
+A Cook-féle távolság alapján 51 megfigyelés (5.0%) minősült potenciális kiugró értéknek (Cook's d > 4/n). A residuumok vizsgálata heteroszkedaszticitásra utalt, ami a robusztus módszerek alkalmazását indokolttá tette.
+
+
+## Regressziós modellek illeszkedése
+
+```{r Modell_illeszkedés}
+
+# Modell illeszkedési mutatók
+compare_performance(mod_lm, mod_rob, metrics = c("R2", "R2_adjusted", "RMSE", "AIC", "BIC"))
+```
+
+
+## Regressziós modellek - Keresztvalidáció
+
+```{r Keresztvalidacio}
+
+# Regressziós modellek keresztvalidációja
+set.seed(123)
+idx <- sample(seq_len(nrow(model_df)), size = floor(0.8 * nrow(model_df)))
+train <- model_df[idx, ]
+test  <- model_df[-idx, ]
+
+m1 <- lm(
+  revision_number ~ atc_group + days_on_market_z + generic + orphan_medicine + accelerated_assessment, 
+  data = train)
+m2 <- lmrob(
+  revision_number ~ atc_group + days_on_market_z + generic + orphan_medicine + accelerated_assessment, 
+  data = train)
+
+pred1 <- predict(m1, newdata = test)
+pred2 <- predict(m2, newdata = test)
+
+# Predikciós hibák
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
+mae  <- function(y, yhat) mean(abs(y - yhat))
+r2_pred <- function(y, yhat) 1 - sum((y - yhat)^2) / sum((y - mean(y))^2)
+
+prediction_comparison <- tibble(
+  Modell = c("OLS", "Robust (lmrob)"),
+  RMSE = round(c(rmse(test$revision_number, pred1), rmse(test$revision_number, pred2)), 3),
+  MAE = round(c(mae(test$revision_number, pred1), mae(test$revision_number, pred2)), 3),
+  R2_pred = round(c(r2_pred(test$revision_number, pred1), r2_pred(test$revision_number, pred2)), 3))
+prediction_comparison
+```
+
+
+## Regressziós modellek - Diagnosztika
+
+```{r Diagnosztika, fig.width=12, fig.height=10}
+
+# Regressziós modellek diagnosztikája (ábra)
+check_model(mod_lm)
+check_model(mod_rob)
+```
+
+
+## Regressziós modellek - Kiugró értékek
+
+```{r Kiugro_ertekek}
+
+# Cook's distance az OLS modellhez
+model_df$cooks_d <- cooks.distance(mod_lm)
+model_df$fitted <- fitted(mod_lm)
+model_df$residuals <- residuals(mod_lm)
+
+# Kiugró értékek azonosítása (Cook's d > 4/n)
+n <- nrow(model_df)
+outliers <- model_df %>%
+  filter(cooks_d > 4/n)
+
+cat("Kiugró értékek száma:", nrow(outliers), "\n")
+cat("Kiugró értékek aránya:", round(nrow(outliers)/n * 100, 1), "%\n")
+
+# Vizualizáció
+ggplot(model_df, aes(x = fitted, y = residuals)) +
+  geom_point(aes(size = cooks_d, color = cooks_d > 4/n), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = "gray50", "TRUE" = "red")) +
+  labs(
+    title = "Residuumok vs. Illesztett értékek",
+    subtitle = "Piros pontok: kiugró értékek (Cook's d > 4/n)",
+    x = "Illesztett értékek",
+    y = "Residuumok",
+    size = "Cook's d",
+    color = "Kiugró"
+  ) +
+  theme_minimal()
+```
+
+
+## Regressziós modellek - Összefoglaló táblázat
+
+```{r Osszefoglalo}
+
+# Összefoglaló táblázat (modelsummary)
+
+modelsummary(
+  list("OLS" = mod_lm, "Robust" = mod_rob),
+  estimate = "{estimate} ({std.error})",
+  statistic = "p.value",
+  stars = TRUE,
+  title = "Regressziós modellek összehasonlítása",
+  coef_rename = c(
+    "atc_groupJ" = "ATC: J",
+    "atc_groupL" = "ATC: L",
+    "atc_groupN" = "ATC: N",
+    "days_on_market_z" = "Piacon töltött idő (z-score)",
+    "genericTRUE" = "Generikus",
+    "orphan_medicineTRUE" = "Orphan gyógyszer",
+    "accelerated_assessmentTRUE" = "Gyorsított eljárás"
+  )
+)
+```
+
+# Összegzés és konklúzió
+
+Jelen elemzés az Európai Gyógyszerügynökség gyógyszer-engedélyezési adatbázisát vizsgálta négy fő kutatási kérdés mentén.
+
+**Engedélyezési trendek.** A gyógyszer-engedélyezések száma jelentős fluktuációt mutatott 1995 és 2023 között, kiugró növekedéssel a COVID-19 pandémia időszakában. Az L csoport (daganatellenes szerek) dominanciája különösen az elmúlt évtizedben vált hangsúlyossá.
+
+**ATC csoportok közötti különbségek.** Szignifikáns különbségek mutatkoztak a revíziók számában (H(3) = 9.39, p = .025) és a piacon töltött időben (H(3) = 48.2, p < .001) a négy leggyakoribb ATC csoport között. Az L csoport gyógyszerei szignifikánsan rövidebb ideje vannak a piacon, ami feltételezhetően az onkológiai területen tapasztalható gyorsabb innovációval magyarázható.
+
+**Revíziószámot befolyásoló tényezők.** A regressziós elemzés alapján a piacon töltött idő, az ATC csoport, a generikus státusz és a gyorsított értékelés szignifikáns prediktorai a revíziók számának. A robusztus regresszió magasabb magyarázóerőt mutatott (R² = .63 vs. .38), ami a kiugró értékek jelentős torzító hatására utal.
+
+**Hálózati kapcsolatok.** A központi idegrendszeri gyógyszerek hálózatelemzése feltárta a terápiás területek és hatóanyagok közötti komplex kapcsolatrendszert. A Parkinson-kór, a Szkizofrénia és az Epilepszia központi pozíciót foglal el a hálózatban, ami ezeknek a betegségterületeknek a terápiás diverzitását tükrözi.
+
+## Limitációk
+
+Az elemzés korlátai közé tartozik, hogy az adatbázis csak az EMA által centralizált eljárásban engedélyezett gyógyszereket tartalmazza, így az eredmények nem általánosíthatók a nemzeti szinten engedélyezett készítményekre. A revíziók száma mint kimeneti változó korlátozottan tükrözi a gyógyszerek tényleges biztonságossági és hatékonysági profilját. A hálózatelemzés keresztmetszeti jellegű, és nem tárja fel az időbeli változásokat a kapcsolatrendszerben.
+
+## Jövőbeli irányok
+
+További kutatások vizsgálhatnák a revíziók tartalmát és típusát, a forgalomból történő kivonások prediktorait, valamint az engedélyezési folyamat időtartamának meghatározó tényezőit.
+
