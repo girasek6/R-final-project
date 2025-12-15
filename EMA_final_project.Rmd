@@ -1,8 +1,17 @@
 ---
 title: "Statisztikai programozás - ELTE PhD - Final project"
 author: "Girasek Hunor (RW8V2Q)"
-output: html_document
-date: "2025-12-15"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    theme: readable
+output_dir: "docs"
+output_file: "index.html"
 ---
 
 ```{r setup, echo=TRUE, message=FALSE, warning=FALSE}
